@@ -1,0 +1,523 @@
+---
+title: "573 Final Paper RMD HT"
+output: pdf_document
+date: "2022-11-08"
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(dplyr)
+library(gbm) 
+library(ggplot2)
+library(caret)
+library(glmnet)
+library(pROC)
+library(class)
+library(MASS)
+library(randomForest)
+library(tree)
+library(e1071)
+```
+
+
+Read and clean data
+```{r}
+set.seed(12345)
+data <- read.csv("Drug_Consumption.csv")
+head(data)
+
+table(data$Age)
+table(data$Gender)
+table(data$Education)
+table(data$Country)
+
+
+par(mfrow = c(2,4))
+for(i in 7:13){
+  boxplot(data[,i], xlab = paste(colnames(data)[i], "scores"), ylab = "normalized scores")
+}
+```
+
+
+Read and clean data 
+```{r}
+
+set.seed(12345)
+data <- read.csv("Drug_Consumption.csv")
+
+# Remove the over-claimers using the control drug "Semer"
+data <- subset(data, data$Semer == "CL0")
+
+for(i in 14:ncol(data)){
+  data[,i] <- as.numeric(data[, i] == "CL4" | data[, i] == "CL5" | data[, i] == "CL6")
+}
+
+# Drop 65+ 
+data <- data %>% mutate(dummy=1) %>%
+spread(key=Age,value=dummy,fill=0)
+
+# Drop Doctorate 
+data <- data %>% mutate(dummy=1) %>%
+spread(key=Education,value=dummy,fill=0)
+
+# Drop other 
+data <- data %>% mutate(dummy=1) %>%
+spread(key=Country,value=dummy,fill=0)
+
+# Drop other
+data <- data %>% mutate(dummy=1) %>%
+spread(key=Ethnicity,value=dummy,fill=0) 
+
+# Drop 'F' variable and rename to gender
+data <- data %>% mutate(dummy=1) %>%
+spread(key=Gender,value=dummy, fill=0)
+
+# Drop variables that we aren't using. 
+drop <- c("ID", "65+","Doctorate degree","Other","F","Amphet","Amyl","Benzos","Choc","Crack", "Coke","Ecstasy","Heroin","Ketamine","Legalh","LSD","Meth","Mushrooms","VSA","Semer")
+data <- data[,!(names(data) %in% drop)]
+
+names(data)[names(data) == "M"] <- "Gender"
+
+# Split into test and train data
+test.i <- sample(1:nrow(data), .3*nrow(data))
+test.data <- data[test.i,]
+train.data <- data[-test.i,]
+```
+
+Generate Tables for Data 
+```{r}
+head(data)
+par(mfrow = c(1,4))
+Alc_table <- table(data$Alcohol)
+Caff_table<- table(data$Caff)
+Cann_table <- table(data$Cannabis)
+Nic_table <- table(data$Nicotine)
+```
+
+
+LASSO Exploration
+```{r}
+set.seed(123)
+#Setting up matrices for lasso
+x <- model.matrix(Cannabis~., data = data)[, -1]
+y <- data$Cannabis
+x.test <- as.matrix(test.data[,-10])
+y.test <- test.data$Cannabis
+
+#CV for Optimal Lambda
+cv.out <- cv.glmnet(x, y, alpha = 1, family = 'binomial')
+plot(cv.out)
+lambda.opt <- cv.out$lambda.min
+lambda.opt # 0.006588544
+
+# Lasso 
+lasso <- glmnet(x, y, alpha = 1, lambda = lambda.opt, family = "binomial")
+
+#Lasso Regression
+lasso.pred <- predict(lasso, s = lambda.opt, newx = x.test, type = "response")
+
+# Assign a class to predictions based on boundary optimization found by this 
+# code. 
+
+cutoffs <- seq(.05, .95, by = .025)
+preds <- rep(0,length(lasso.pred))
+error.lasso <- rep(0,length(lasso.pred))
+lasso.test.err <- rep(NA, length(cutoffs))
+
+for(i in 1:length(cutoffs)){
+  preds <- ifelse(lasso.pred < cutoffs[i], 0, 1)
+    
+  for(e in 1:length(preds)){
+    error.lasso[e] <- (preds[e] == y.test[e])
+  }
+  
+  lasso.test.err[i] = (length(error.lasso)-sum(error.lasso))/length(error.lasso)
+}
+
+df <- data.frame(cutoffs, lasso.test.err)
+ggplot(data = df, aes(x = cutoffs, y = lasso.test.err)) +
+  geom_point() +
+  geom_line() +
+  xlab("Boundary Cutoffs") +
+  ylab("Misclassification Error")
+
+min(lasso.test.err) # 0.1725979
+cutoffs[which.min(lasso.test.err)] # 0.5
+
+# This process verified that 0.5 is the optimal cutoff to minimize test error
+# using this lasso regression. We reached a test error rate of 0.1725979 or 
+# a success rate of 82.74% 
+
+#Predictor Coefficients after Lasso
+coef(lasso)
+
+# Make a new data set removing the variables considered insignificant by the
+# lasso regression.
+data.lasso <-  subset(data, select = -c(Escore, AScore, Impulsive, Caff, `35-44`, `Left school at 17 years`, `Professional certificate/ diploma`, Canada, `Republic of Ireland`, Black, `Mixed-White/Black`, White))
+
+# Test and training sets for lasso
+test.lasso <- data.lasso[test.i,]
+train.lasso <- data.lasso[-test.i,]
+
+#Lasso Plot
+par(mar=c(5, 4, 4, 8), xpd=TRUE)
+lasso.plot <- glmnet(x, y, alpha = 1)
+plot(lasso.plot, "lambda", col = 1:36)
+legend("topright", inset=c(-0.6, -.4), lwd = 1, col= 1:37, legend = colnames(data[,-10]), cex = 0.5)
+
+lasso.pred <- as.numeric(lasso.pred)
+ROC.score.lasso <- roc(test.data$Cannabis, lasso.pred)
+ggroc(ROC.score.lasso, legacy.axes = FALSE) +
+  ggtitle("ROC curve for lasso regression")
+
+
+
+```
+
+
+Boosting - Finding the optimal shrinkage parameter
+```{r}
+# Cycle through the shrinkage parameters to find the ideal value based on
+# test MSE. Plot test error along different shrinkage values to find the 
+# ideal value.
+
+# We will find the optimal cutoff for the prediction boundary using the  
+# optimal shrinkage coefficient found through through this process. We will use
+# 0.5 as the cutoff for this process and we will optimize the decision
+# boundary based on the optimal shrinkage value to compensate for the unequal
+# distribution of class 0 (not used Cannabis within the last month) and 1 (used
+# Cannabis within the last month) in the data set. We also aim to reduce 
+# test error by optimizing the decision boundary. 
+set.seed(12345)
+shrinkage <- seq(from = 0.01, to = .5, by = .0049)
+boost.test.err <- rep(0, length(shrinkage))
+error <- rep(0, nrow(test.data))
+
+for(i in 1:length(shrinkage)){
+  boost <- gbm(Cannabis ~ ., data = train.data, 
+               distribution = 'bernoulli',
+               n.trees = 200,
+               shrinkage = shrinkage[i])
+
+  pred.boost <- predict(boost, 
+                        n.trees=100, 
+                        newdata = test.data, 
+                        type = 'response')
+
+  pclass.boost <- rep(NA, length(pred.boost))
+  
+  for(n in 1:length(pred.boost)){
+    if(pred.boost[n] < 0.5){ 
+      pclass.boost[n] = 0
+    }else{
+      pclass.boost[n] = 1
+    }
+  }
+  
+  for(e in 1:length(pclass.boost)){
+    error[e] <- ((pclass.boost[e]) == test.data$Cannabis[e])
+  }
+  
+  boost.test.err[i] = (length(error)-sum(error))/length(error)
+}
+
+df <- data.frame(shrinkage, boost.test.err)
+ggplot(data = df, aes(x = shrinkage, y = boost.test.err)) +
+  geom_point() +
+  stat_smooth(method = "glm", formula = y ~ x + I(x^2), size = 1, col = "dark blue") +
+  xlab("Shrinkage Parameters") +
+  ylab("Misclassification Error")
+
+shrinkage[which.min(boost.test.err)] # Use .23
+min(boost.test.err) # 0.186
+
+# From this chart, we see that shrinkage coefficients between .01 and .5 are
+# the ideal values. I will not use the shrinkage value with the lowest test
+# error (0.4804) because it appears to be an outlier. I will stick within the
+# ideal range and use the shrinkage value of 0.186 as it had a low test error
+# and it is the approximate bottom of the regression line of test errors. 
+
+
+```
+
+
+Boosting - Finding the optimal decision boundary
+```{r}
+# Pick the ideal boundary cutoff using the ideal shrinkage value
+# Plot the test MSE along different cutoff values of class 0/1 
+cutoffs <- seq(.05, .95, by = .025)
+set.seed(12345)
+boost.test.err <- rep(0, length(cutoffs))
+error <- rep(0, nrow(test.data))
+
+boost.2 <- gbm(Cannabis ~ ., data = train.data, 
+             distribution = 'bernoulli',
+             n.trees = 200,
+             shrinkage = .23)
+
+pred.boost.2 <- predict(boost.2, 
+                      n.trees=100, 
+                      newdata = test.data, 
+                      type = 'response')
+
+pclass.boost.2 <- rep(NA, length(pred.boost.2))
+
+for(i in 1:length(cutoffs)){
+  pclass.boost.2 <- ifelse(pred.boost.2 < cutoffs[i], 0, 1)
+  
+  for(e in 1:length(pclass.boost.2)){
+    error[e] <- (pclass.boost.2[e] == test.data$Cannabis[e])
+  }
+  boost.test.err[i] = (length(error)-sum(error))/length(error)
+  
+}
+
+df <- data.frame(cutoffs, boost.test.err)
+ggplot(data = df, aes(x = cutoffs, y = boost.test.err)) +
+  geom_point() +
+  geom_line() +
+  xlab("Boundary Cutoffs") +
+  ylab("Misclassification Error")
+
+cutoffs[which.min(boost.test.err)] # 0.425
+min(boost.test.err) # 0.1743772
+
+
+```
+
+
+Boosting - Combine ideal shrinkage coefficient and ideal cutoff value
+```{r}
+set.seed(12345)
+error <- rep(0, nrow(test.data))
+
+boost <- gbm(Cannabis ~ ., data = train.data, 
+             distribution = 'bernoulli',
+             n.trees = 500,
+             shrinkage = 0.23)
+
+pred.boost <- predict(boost, 
+                      n.trees=100, 
+                      newdata = test.data, 
+                      type = 'response')
+
+pclass.boost <- ifelse(pred.boost < .425, 0, 1)
+  
+for(e in 1:length(pclass.boost)){
+  error[e] <- (pclass.boost[e] == test.data$Cannabis[e])
+}
+
+boost.test.err = (length(error)-sum(error))/length(error)
+boost.test.err # 0.1743772
+boost.success.rate <- 1 - boost.test.err
+boost.success.rate # 0.8256228
+
+# This code runs the model using the optimized shrinkage parameter and boundary
+# cutoff. We reached an error rate of 17.43%, or a success rate of 82.56%. 
+
+```
+
+
+Logistic Regression
+```{r}
+# In this code, we  use logistic regression to generate a binary prediction
+# model to predict if an individual has used Cannabis within the last month.
+
+# We will cycle through decision boundaries from 5% to 95% and calculate test
+# error at each cutoff. This will be used to find the error-minimizing decision
+# boundary of our model. 
+
+set.seed(12345)
+log.fit <- glm(Cannabis ~ ., data = train.data, family = "binomial")
+
+cutoffs <- seq(.05, .95, by = .025)
+probs <- predict(log.fit, test.data, type = "response")
+preds <- rep(0, length(probs))
+error.log <- rep(0,length(probs))
+log.test.err <- rep(NA, length(cutoffs))
+
+for(i in 1:length(cutoffs)){
+  preds <- ifelse(probs < cutoffs[i], 0, 1)
+    
+  for(e in 1:length(preds)){
+    error.log[e] <- (preds[e] == test.data$Cannabis[e])
+  }
+  
+  log.test.err[i] = (length(error.log)-sum(error.log))/length(error.log)
+}
+
+df <- data.frame(cutoffs, log.test.err)
+ggplot(data = df, aes(x = cutoffs, y = log.test.err)) +
+  geom_point() +
+  geom_line() +
+  xlab("Boundary Cutoffs") +
+  ylab("Misclassification Error")
+
+min(log.test.err) # 0.1761566
+cutoffs[which.min(log.test.err)] # 0.35
+
+
+# ======================================================
+# Identified ideal cutoff at 0.325 Rerun logistic regression using the ideal
+# cutoff and calculate the confusion matrix to see the false positive rate,
+# false negative rate, and model accuracy. 
+
+log.fit <- glm(Cannabis ~ ., data = train.data, family = "binomial")
+summary(log.fit)
+
+probs <- predict(log.fit, test.data, type = "response")
+preds <- rep(0, length(probs))
+preds[probs > 0.35] = 1
+
+preds <- as.factor(preds)
+test.data$Cannabis <- as.factor(test.data$Cannabis)
+confusionMatrix(test.data$Cannabis, preds) #  82.38% 
+
+# Accuracy of 82.38%
+# FPR = 5.69395%
+# FNR = 11.92171%
+
+#ROC-curve using pROC library
+test.data$Cannabis <- as.numeric(test.data$Cannabis)
+preds <- as.numeric(preds)
+ROC.score.log <- roc(test.data$Cannabis, preds)
+ggroc(ROC.score.log, legacy.axes = FALSE) +
+  ggtitle("ROC curve for logistic regression")
+
+
+```
+
+RECLEAN DATA 
+```{r}
+
+set.seed(12345)
+data <- read.csv("Drug_Consumption.csv")
+
+# Remove the over-claimers using the control drug "Semer"
+data <- subset(data, data$Semer == "CL0")
+
+for(i in 14:ncol(data)){
+  data[,i] <- as.numeric(data[, i] == "CL4" | data[, i] == "CL5" | data[, i] == "CL6")
+}
+set.seed(1000)
+
+# Drop 65+ 
+data <- data %>% mutate(dummy=1) %>%
+spread(key=Age,value=dummy,fill=0)
+
+# Drop Doctorate 
+data <- data %>% mutate(dummy=1) %>%
+spread(key=Education,value=dummy,fill=0)
+
+# Drop other 
+data <- data %>% mutate(dummy=1) %>%
+spread(key=Country,value=dummy,fill=0)
+
+# Drop other
+data <- data %>% mutate(dummy=1) %>%
+spread(key=Ethnicity,value=dummy,fill=0) 
+
+# Drop 'F' variable and rename to gender
+data <- data %>% mutate(dummy=1) %>%
+spread(key=Gender,value=dummy, fill=0)
+
+# Drop variables that we aren't using. 
+drop <- c("ID", "65+","Doctorate degree","Other","F","Amphet","Amyl","Benzos","Choc","Crack", "Coke","Ecstasy","Heroin","Ketamine","Legalh","LSD","Meth","Mushrooms","VSA","Semer")
+data <- data[,!(names(data) %in% drop)]
+
+names(data)[names(data) == "M"] <- "Gender"
+
+# Split into test and train data
+test.i <- sample(1:nrow(data), .3*nrow(data))
+test.data <- data[test.i,]
+train.data <- data[-test.i,]
+```
+
+
+kNN
+```{r}
+set.seed(12345)
+ks <- 1:50
+knn.error <- rep(0, length(ks))
+
+for(i in 1:length(ks)){
+  pred.knn <- knn(train.data, test.data, train.data$Cannabis, k = ks[i])
+  table.knn <- table(pred.knn, test.data$Cannabis) 
+  knn.error[i] <- (table.knn[1,2] + table.knn[2,1])/(table.knn[1,2] + table.knn[2,1] + table.knn[2,2] + table.knn[1,1]) 
+}
+
+df.knn = data.frame(ks, knn.error)
+ggplot(data = df.knn, aes(x = ks, y = knn.error)) +
+  geom_point() +
+  stat_smooth(method = "glm", formula = y ~ x + I(x^2), size = 1, col = "dark blue") +
+  xlab("Number of Neighbors") +
+  ylab("Misclassification Error")
+
+which.min(knn.error) # k = 22 results in the minimum error
+min(knn.error) # 0.09252669, or a success rate of 90.74733%
+
+```
+
+
+SVM
+```{r}
+x_SVM <- train.data[,-10]
+y_SVM <- train.data[,10]
+SVM_data <- data.frame(x = x_SVM, y = as.factor(y_SVM))
+SVM_model <- svm(y~., data = SVM_data, kernel = "linear", scale = FALSE, cost = 10)
+SVM_model
+SVM_predict <- predict(SVM_model, data.frame(x = test.data[,-10], y = test.data[,10]))
+# Ideal cost is 1.92875e-22
+# minimum error is 0.192923
+
+table.SVM <- table(SVM_predict, test.data$Cannabis)
+table.SVM
+(table.SVM[1,2] + table.SVM[2,1])/(table.SVM[1,2] + table.SVM[2,1] + table.SVM[1,1] + table.SVM[2,2])
+
+```
+
+
+Decision Trees 
+```{r}
+set.seed(12345)
+tree_train <- data.frame(train.data)
+tree_test <- data.frame(test.data)
+treefit <- tree(as.factor(Cannabis)~. ,data = tree_train)
+summary(treefit)
+# variables used : UK, 18-24, Oscore, Nicotine, gender, and SS
+plot(treefit)
+text(treefit)
+
+tree.predict <- predict(treefit, tree_test, type = "class")
+tree.table <-table(tree.predict, tree_test$Cannabis) 
+tree.error <- (tree.table[1,2] + tree.table[2,1])/(tree.table[1,2] + tree.table[2,1] + tree.table[1,1] + tree.table[2,2])
+tree.error # 0.1992883
+
+```
+
+Random Forest
+```{r}
+set.seed(12345)
+rF <- randomForest(as.factor(Cannabis)~., data = tree_train, importance = TRUE)
+rf.predict <- predict(rF, tree_test)
+rf.table <-table(rf.predict, tree_test$Cannabis) # .2009 error rate
+rf.table
+rf.error <- (rf.table[1,2] + rf.table[2,1])/(rf.table[1,2] + rf.table[2,1] + rf.table[1,1] + rf.table[2,2])
+rf.error # 0.1814947
+```
+
+LDA
+```{r}
+set.seed(12345)
+lda.fit <- lda(as.factor(Cannabis)~., data = train.data)
+lda.fit
+
+lda.pred <- predict(lda.fit, test.data)$class
+table.lda <- table(lda.pred, test.data$Cannabis)
+
+lda.error <- (table.lda[1,2] + table.lda[2,1])/(table.lda[1,2] + table.lda[2,1] + table.lda[1,1] + table.lda[2,2])
+lda.error # 0.1886121
+
+```
+
